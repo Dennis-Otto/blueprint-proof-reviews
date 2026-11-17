@@ -1,0 +1,31 @@
+# The answers of the blueprint (https://github.com/Dennis-Otto/repo-blueprint);
+# `copier update` reads them to bring the repository up to the latest release.
+# Change one only with `copier update --defaults --vcs-ref=:current: --data name=value`,
+# on a branch and merged in a pull request, as the FAQ of the blueprint shows:
+# https://github.com/Dennis-Otto/repo-blueprint/blob/main/docs/faq.md#how-do-i-change-an-answer-later
+_commit: v1.21.0
+_src_path: https://github.com/Dennis-Otto/repo-blueprint.git
+author: Dennis Otto
+copyright: 2026 Dennis Otto
+description: A throwaway repository for the live test of the settings as code of Repo
+    Blueprint.
+discussions: false
+homepage: ''
+issue_assistant_ai: false
+languages:
+- python
+license: MIT
+owner: Dennis-Otto
+project_name: Blueprint proof reviews
+project_slug: blueprint-proof-reviews
+project_type: generic
+release_app: dennis-otto-release-automation
+release_app_client_id: Iv23liP9PIEHOV74AiIA
+release_app_id: '4739928'
+renovate_runner: hub
+sample_code: false
+sponsor: ''
+successor: false
+test_marker: ''
+test_workflows: ''
+topics: test

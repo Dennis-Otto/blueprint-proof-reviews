@@ -1,0 +1,317 @@
+// The rules of Renovate from the blueprint, which .github/renovate.json5 extends.
+// Renovate keeps the actions, the dependencies, the images and the pins of the
+// workflows current; the Renovate workflow of the blueprint runs it for every
+// repository with a .github/renovate.json5, as the release app. An update waits a
+// week after its release; one that fixes a vulnerability comes at once, and so does
+// the new commit of a branch that an action follows. Every update, a major one too,
+// and the weekly refresh of the lock files from versions a week old, merge on their
+// own once every check passes; the refresh of a package manager that can't keep to
+// that age waits for the maintainer. Updates of what the users run are
+// committed as fix(deps) and lead to a patch release, updates of the tools as
+// chore(deps).
+// Renovate keeps no issue open: what waits for the maintainer is a pull request,
+// and its warnings and errors reach the issue "Renovate logs problems".
+// https://github.com/Dennis-Otto/repo-blueprint
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  // The versions that an osv-scanner.toml accepts with every advisory, which no
+  // update of a lock file can fix, such as one that another package pins exactly:
+  // .github/renovate-accepted.json5 has a rule for each, which blueprint.py writes,
+  // so that Renovate tries no fix of them and logs no empty commit in every run.
+  extends: [
+    "config:recommended",
+    ":semanticCommits",
+    "local>Dennis-Otto/blueprint-proof-reviews//.github/renovate-accepted.json5",
+  ],
+  timezone: "Europe/Berlin",
+  // No dependency dashboard, so that a repository can have no open issue: the
+  // updates merge on their own, and what waits for the maintainer is a pull
+  // request. Renovate closes the issue of the dashboard by its title, which stays
+  // the one that it had. Since Renovate 44.232.0 both are in one object, and its
+  // check of the configuration rejects the two settings of before.
+  dependencyDashboard: { enabled: false, title: "Dependency dashboard" },
+  // Once a week, so that the release bot sums the updates up in one release: the
+  // whole Monday, since GitHub starts the runs of the bot every two hours only
+  // roughly and now and then skips one, so that a window of a few hours could
+  // pass without a run and hold the updates back for another week.
+  schedule: ["* * * * 1"],
+  minimumReleaseAge: "7 days",
+  // In the same window, the lock files of every package manager are refreshed:
+  // their indirect dependencies move to their newest versions, a week old where the
+  // package manager can keep to that.
+  lockFileMaintenance: { enabled: true, schedule: ["* * * * 1"] },
+  internalChecksFilter: "strict",
+  // GitHub merges an update once every required check passes.
+  platformAutomerge: true,
+  automergeType: "pr",
+  automergeStrategy: "squash",
+  // Renovate keeps its own branches up to date with main.
+  rebaseWhen: "behind-base-branch",
+  // The title check sets the labels.
+  labels: [],
+  prConcurrentLimit: 10,
+  prHourlyLimit: 0,
+  // The tools of the tests are kept current as well.
+  ignorePaths: ["**/node_modules/**", "**/vendor/**"],
+  vulnerabilityAlerts: {
+    minimumReleaseAge: null,
+    schedule: ["at any time"],
+    automerge: true,
+  },
+  osvVulnerabilityAlerts: true,
+  // Renovate logs at the level info alone that two updates of one dependency met in
+  // one branch and that it dropped one of them. When the one that it kept waits, as
+  // for its release age, neither comes; as a warning, it reaches the issue "Renovate
+  // logs problems".
+  // An image without a date of its release comes without the week of waiting, by the
+  // rule of the images, and Renovate warns of it in every run; that is no problem.
+  logLevelRemap: [
+    { matchMessage: "Ignoring upgrade collision", newLogLevel: "warn" },
+    { matchMessage: "/did not have a releaseTimestamp/", newLogLevel: "info" },
+  ],
+  // Python, Node and PHP follow the blueprint and what the project supports.
+  pyenv: { enabled: false },
+  nvm: { enabled: false },
+  // The Features of the dev container and their lock file are Dependabot's.
+  devcontainer: { enabled: false },
+  // The blueprint bot brings the updates of the blueprint.
+  copier: { enabled: false },
+  // The hash-pinned requirements are compiled from their .in files. Renovate
+  // installs pip-tools once per repository, for the Python of the first lock file
+  // it compiles: a lock file for another Python is compiled with
+  // `uv pip compile --python-version=`, which doesn't depend on the Python it runs
+  // on. Renovate compiles a lock file again with the command in its header, and
+  // skips the file for good if an option is new to it or lacks the = before its
+  // value.
+  pip_requirements: { enabled: false },
+  "pip-compile": { managerFilePatterns: ["/(^|/)requirements[^/]*\\.txt$/"] },
+  // The hooks of .pre-commit-config.yaml, which Renovate leaves alone by default.
+  "pre-commit": { enabled: true },
+  customManagers: [
+    {
+      // Images that the scripts of workflows and checks start, by tag and digest,
+      // also in a variable such as IMAGE="name:tag@sha256:…".
+      customType: "regex",
+      managerFilePatterns: [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/(^|/)[^/]+\\.sh$/",
+      ],
+      matchStrings: [
+        "(?:^|[\\s\"'=])(?<depName>[a-z0-9][a-z0-9._-]*(?:/[a-z0-9._-]+)+):(?<currentValue>v?\\d[a-zA-Z0-9._-]*)@(?<currentDigest>sha256:[a-f0-9]{64})",
+      ],
+      datasourceTemplate: "docker",
+    },
+    {
+      // A version below a line "# renovate: datasource=… depName=…", in YAML
+      // (NAME: 1.2.3) or in the shell (name=1.2.3). extractVersion= takes the
+      // version out of the tag of a release, such as v1.2.3.
+      customType: "regex",
+      managerFilePatterns: [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/(^|/)[^/]+\\.sh$/",
+      ],
+      matchStrings: [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\n\\s*[\\w-]+(?:: |=)\"?(?<currentValue>[^\"\\s@]+)(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?\"?",
+      ],
+    },
+  ],
+  packageRules: [
+    {
+      // Every update merges on its own, a week after its release, a major one too:
+      // the checks are the gate, and one whose checks fail stays open and shows the
+      // failure (decision 0150 of the blueprint).
+      matchUpdateTypes: ["major", "minor", "patch", "digest", "pin", "pinDigest"],
+      automerge: true,
+    },
+    {
+      // The weekly refresh of the lock files brings the newest version of every
+      // indirect dependency. That of a package manager that can't keep to versions
+      // a week old, such as Composer, waits for the maintainer, on a branch of its
+      // own whose name begins with review-. Renovate builds a refresh anew only in
+      // its weekly window, so that what merges is what the checks and the maintainer
+      // saw.
+      matchUpdateTypes: ["lockFileMaintenance"],
+      minimumReleaseAge: null,
+      automerge: false,
+      updateNotScheduled: false,
+      additionalBranchPrefix: "review-",
+    },
+    {
+      // npm and pip-compile keep their refresh to versions at least a week old, as
+      // every other update waits a week, so it merges by itself once every check
+      // passes (decision 0137 of the blueprint). From minimumReleaseAge, Renovate
+      // gives npm --before= a week ago, for this rule alone; the refresh has no
+      // release date, so the age check of Renovate keeps no status, which would wait
+      // for ever. The rule below compiles the lock files of pip-compile again. The
+      // fix of a vulnerability still comes at once, as neither applies to it. The
+      // check dependency-review holds the refresh when a younger version comes
+      // anyway, and the branch bot keeps it up to date with main.
+      matchManagers: ["npm", "pip-compile"],
+      matchUpdateTypes: ["lockFileMaintenance"],
+      minimumReleaseAge: "7 days",
+      statusCheckWhen: { minimumReleaseAge: "never" },
+      automerge: true,
+      additionalBranchPrefix: "",
+    },
+    {
+      // After Renovate compiled the lock files of pip-compile anew, blueprint.py
+      // compiles them again with uv, from uploads at least a week old; a version that
+      // the repository pins already stays, such as the fix of a vulnerability.
+      matchManagers: ["pip-compile"],
+      matchUpdateTypes: ["lockFileMaintenance"],
+      postUpgradeTasks: {
+        commands: ["python3 .github/blueprint.py locks --refresh"],
+        fileFilters: ["**/requirements*.txt"],
+        executionMode: "branch",
+        installTools: { python: {}, uv: {} },
+      },
+    },
+    {
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pin", "pinDigest"],
+      groupName: "the actions",
+    },
+    {
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["major"],
+      groupName: "the actions to a new major version",
+    },
+    {
+      // An action pinned to a commit of a branch, with the branch in its comment, as
+      // a project may add one: zizmor reports the pin as soon as the branch moves on,
+      // and every commit to the branch starts the week of waiting anew, so Renovate
+      // would never catch up with a branch that moves every few days. It follows the
+      // branch in its next run instead.
+      matchManagers: ["github-actions"],
+      matchDatasources: ["github-digest"],
+      minimumReleaseAge: null,
+      schedule: ["at any time"],
+      automerge: true,
+      groupName: "the actions that follow a branch",
+    },
+    {
+      // The issue assistant comes with its templates, with which its check compares
+      // the workflows: a pin that moved alone would fail the check issue-assistant.
+      // The sync bot of the blueprint takes over each verified release, workflows and
+      // pins together, and the blueprint bot brings it to every repository.
+      matchManagers: ["github-actions"],
+      matchDepNames: ["Dennis-Otto/issue-assistant"],
+      enabled: false,
+    },
+    {
+      // The versions of Python, Node and PHP that the workflows set up, and the
+      // runners, follow the blueprint.
+      matchDepTypes: ["uses-with"],
+      enabled: false,
+    },
+    {
+      matchDatasources: ["github-runners"],
+      enabled: false,
+    },
+    {
+      // So does the uv that they set up, on its line "# renovate:".
+      matchManagers: ["custom.regex"],
+      matchDepNames: ["uv"],
+      matchFileNames: [".github/workflows/**"],
+      enabled: false,
+    },
+    {
+      // And the tools that they and the scripts of .github download and check by
+      // their sha256, each on its line "# renovate:": the blueprint writes the
+      // checksum of each new version beside it.
+      matchManagers: ["custom.regex"],
+      matchDepNames: ["sigstore/gitsign", "infection/infection", "ChristophWurst/krankerl", "nextcloud/server", "anchore/syft", "lycheeverse/lychee", "gitleaks/gitleaks"],
+      matchFileNames: [".github/workflows/**", ".github/sign-tag.sh", ".github/lychee.sh", ".github/gitleaks.sh"],
+      enabled: false,
+    },
+    {
+      // The tools of the prose check belong to the blueprint, which keeps them current.
+      matchFileNames: [".github/prose/**"],
+      enabled: false,
+    },
+    {
+      // So do the tools of the accessibility check of the website.
+      matchFileNames: [".github/a11y/**"],
+      enabled: false,
+    },
+    {
+      // An image whose registry gives Renovate no date of its release comes without
+      // the week of waiting, and one with a date still waits a week: ghcr.io,
+      // mcr.microsoft.com and quay.io give no date, and Docker Hub none to a request
+      // without a login for an image of more than 1,000 tags, such as nextcloud,
+      // postgres, python or redis. Renovate would hold an update without a date for
+      // good (decision 0148 of the blueprint). The digest keeps the image the one that
+      // the checks of the pull request tested.
+      matchDatasources: ["docker"],
+      minimumReleaseAgeBehaviour: "timestamp-optional",
+    },
+    {
+      // So the packages of Playwright come without the week as well: each of its
+      // images on mcr.microsoft.com, which give no date, holds the browsers of one
+      // release, which only the package of the same release starts. With the week
+      // for the package alone, the group of a project put the newest image beside a
+      // package some patches older, and each update of Playwright failed its checks
+      // until its package was a week old (decision 0168 of the blueprint). The image
+      // of the same release, which runs at once, carries the code of that release.
+      matchDatasources: ["npm", "pypi"],
+      matchPackageNames: ["playwright", "playwright-core", "@playwright/**"],
+      minimumReleaseAge: null,
+    },
+    {
+      // And the images of Playwright, which came at once already, have no release age
+      // either: Renovate gives npm the release age of the first update of a group as
+      // --before, often the image's. npm then found no package of the same release
+      // that old, installed it again without --before and warned of it in every run
+      // until the update merged (decision 0168 of the blueprint).
+      matchDatasources: ["docker"],
+      matchPackageNames: [
+        "mcr.microsoft.com/playwright",
+        "mcr.microsoft.com/playwright/**",
+      ],
+      minimumReleaseAge: null,
+    },
+    {
+      matchDatasources: ["docker"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pin", "pinDigest"],
+      groupName: "the images",
+    },
+    {
+      // The new digest of a tag that stays goes into a branch of its own, beside that
+      // of its group, also of a group of the project: in one branch with the new
+      // version of the same image, Renovate would drop one of the two.
+      matchDatasources: ["docker"],
+      matchUpdateTypes: ["digest", "pinDigest"],
+      group: {
+        branchTopic: "{{{groupSlug}}}-digests",
+        commitMessageTopic: "the digests of {{{groupName}}}",
+      },
+    },
+    {
+      // The check lint runs the markdownlint-cli2 of its action, and
+      // scripts/markdownlint.sh that of its image: both move in one pull request, so
+      // that the Markdown that passes scripts/check.sh passes lint as well, also with
+      // the new major version of the action that a new markdownlint-cli2 brings. The
+      // tests of the blueprint fail while the two differ.
+      matchDepNames: ["DavidAnson/markdownlint-cli2-action", "davidanson/markdownlint-cli2"],
+      groupName: "markdownlint-cli2",
+      separateMajorMinor: false,
+    },
+    {
+      // The dev container keeps the Python, PHP or Node of the project, as the CI
+      // does; only its digest moves.
+      matchDepNames: ["mcr.microsoft.com/devcontainers/**"],
+      matchUpdateTypes: ["major", "minor", "patch"],
+      enabled: false,
+    },
+    {
+      // MkDocs stays below 2 until every website moves to Zensical (decision 0146 of
+      // the blueprint): its 2.0 leaves out the plugins and the theme that the website
+      // is built with, and Material for MkDocs, whose maintenance ends on 5 May 2027,
+      // requires a MkDocs below 2 as well. A stable 2.0 would otherwise come as a
+      // routine pull request that breaks the build of the website.
+      matchDatasources: ["pypi"],
+      matchPackageNames: ["mkdocs"],
+      allowedVersions: "<2",
+    },
+  ],
+}

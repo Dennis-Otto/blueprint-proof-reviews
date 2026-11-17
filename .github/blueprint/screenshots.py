@@ -1,0 +1,1999 @@
+"""The pictures of a project that its own script renders, renewed by a bot only when a
+change shows.
+
+A project turns the screenshot bot on with scripts/screenshots.sh, which renders its
+pictures in place, wherever the documentation, the stores or the social preview take
+them from, and lists in .github/screenshots-paths.txt the files whose change can
+change them. The Screenshots workflow runs the script on main after such a change,
+after a release, every week and on demand. keep compares each picture that changed
+with the one that main has, by its pixels: one whose pixels stayed the same gets the
+committed file back, so that a new encoder, a new browser or another runner changes
+no file, and what is left goes into a folder for the bot's pull request.
+commit_request turns that folder into commits of the release app, which take nothing
+but pictures, by paths of plain names, from that folder. A picture that came out at
+another size would leave a page that names its width and height with the wrong shape:
+corrected_pages rewrites those numbers on the pages of the checkout, and nothing else.
+
+.github/screenshots.toml, which belongs to the project, can name the shards that
+render side by side, each on a runner of its own, whose folders collect puts together
+for the one pull request; the files besides pictures that the script renders and the
+bot commits, by their exact paths; and the hosts that the jobs that render may reach,
+of which Harden-Runner then lets through no other. It can also leave hosts out of the
+wait for Harden-Runner before the script runs, give the script a time limit of its
+own, and name the folder that a failed render keeps for a person to see. Without it,
+one job renders every picture, the bot takes only pictures, and Harden-Runner only
+records the traffic.
+"""
+
+from __future__ import annotations
+
+import base64
+import html
+import io
+import itertools
+import json
+import os
+import posixpath
+import re
+import struct
+import subprocess
+import tomllib
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import SplitResult, unquote, urlsplit
+
+if TYPE_CHECKING:
+    from PIL import Image
+
+SCRIPT = Path("scripts/screenshots.sh")
+PATHS = Path(".github/screenshots-paths.txt")
+SETTINGS = Path(".github/screenshots.toml")
+# A shard, as it names a job, an artifact and the variable SCREENSHOTS_SHARD.
+SHARD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# The most jobs that one matrix of GitHub Actions runs.
+MOST_SHARDS = 256
+# The one job of a project that names no shards, which renders every picture.
+WHOLE = "all"
+# A host as Harden-Runner allows it, by its name in small letters, or *. and a name
+# for every name below it, and its port.
+HOST = re.compile(
+    r"(?:\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+"
+    r":(?P<port>[0-9]{1,5})"
+)
+# The time limit of the job render, in minutes, which a test keeps equal to that of the
+# workflow: the script gets it when the settings give it none of its own. A limit of
+# the settings leaves the steps around the script at least a quarter of an hour, for
+# the wait for the hosts, the tools, the comparison and the artifact of a failure.
+JOB_MINUTES = 60
+MOST_MINUTES = 45
+# The keys that .github/screenshots.toml may set, in the order of the documentation.
+KEYS = ("shards", "files", "hosts", "skip_wait", "timeout_minutes", "failure_folder")
+# The folders in which the bot writes no file besides pictures: the history, and the
+# workflows with the settings of the repository and of its bots.
+CLOSED = (".git", ".github")
+# The pictures that the bot commits, by their endings, and how each file starts; an
+# MP4 starts with the size of its first box, which looks_like_its_kind skips. A
+# video, such as one that a website plays in place of a GIF, has no pixels that
+# Pillow reads, so it counts as changed when its bytes change; beside a GIF of the
+# same name, which it shows, only together with that GIF.
+SIGNATURES = {
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".gif": (b"GIF87a", b"GIF89a"),
+    ".webp": (b"RIFF",),
+    ".mp4": (b"ftyp",),
+}
+PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+# What one request to GitHub's GraphQL API carries at most: larger sets of pictures
+# go in several commits.
+LARGEST = 8_000_000
+COMMIT = (
+    "mutation($input: CreateCommitOnBranchInput!) "
+    "{ createCommitOnBranch(input: $input) { commit { oid } } }"
+)
+REPORT = "report.json"
+# The most files that GitHub's comparison of two commits lists.
+COMPARED_FILES = 300
+SOCIAL_PREVIEW = ".github/social-preview.png"
+# The width and the height of a picture, in pixels.
+Size = tuple[int, int]
+# A box in a picture, as Pillow's getbbox gives it: left, top, right and bottom, the
+# last two one past the box.
+Box = tuple[int, int, int, int]
+# The red of each changed pixel of a difference and of the frames around the changes,
+# as the visual checks of the repositories draw it.
+RED = (220, 38, 38)
+# A difference shows the new picture in its own colors behind a thin veil of its own
+# average color, this share of each pixel: it softens the picture a little, so that
+# the red of the changes stands out, while a dark page stays dark, a light one light,
+# and the picture and its text stay clear.
+VEIL = 0.2
+# The threshold of sight (decision 0169). A pixel changed only when both hold:
+# - one of its colors, or its opacity, lies more than TOLERANCE of 255 beyond those of
+#   the same place and its eight neighbors in the other picture, either way: the box
+#   around the colors of the neighbors takes every shade between them, which is what
+#   the edge of a letter is made of, so an edge drawn a pixel further is no change;
+# - and the average of the square of three by three pixels around it, as an eye sees a
+#   pixel together with its neighbors, lies more than AVERAGE of 255 beyond those
+#   averages at the same place and its neighbors in the other picture, either way: a
+#   letter drawn half a pixel further keeps its averages nearby, and another letter
+#   doesn't, not even a 6 for a 5, nor a single white pixel on blue.
+# A GIF that picks other colors of its palette for the same page, by up to 13 of 255
+# and up to 38 at the edges of letters in the pictures of paperless-sync#511, changes
+# no pixel so; a moved button, another text or another color do.
+TOLERANCE = 24
+AVERAGE = 10
+# About the width at which a phone, or Telegram, shows a picture: the frames around the
+# changes of a difference keep their size in such pixels, so that a change of a
+# single pixel still shows. In those pixels: the width of a frame, the gap between a
+# frame and its changes, and how near to each other changes are that share a frame.
+SHOWN = 1000
+FRAME = 4
+MARGIN = 6
+NEAR = 16
+# A picture changed all over when the frames around its changes would cover more than
+# this share of it: then no frame points anywhere, and the report and the table say so
+# in words. More than MOST_MARKS frames become one around them all, which counts
+# alike. More than MOST_REGIONS groups of changes are all over without joining their
+# frames, which would take longer than the comparison itself.
+ALL_OVER = 0.2
+MOST_MARKS = 12
+MOST_REGIONS = 100
+# A comparison cuts both pictures to their changes, with room around them, and keeps
+# at least a part of each side of the picture, so that one sees where on the page the
+# changes are: both in pixels of the picture shown SHOWN pixels wide at its longer side.
+ROOM = 60
+CONTEXT = 360
+# The strip between the place before and after, with an arrow from one to the other,
+# in pixels of the comparison shown SHOWN pixels wide, and its colors.
+GAP = 28
+STRIP = (75, 85, 99)
+ARROW = (255, 255, 255)
+# The shape of the screen of a phone held upright, width to height: a comparison puts
+# both places side by side or one above the other, whichever such a screen shows larger.
+PHONE = (9, 16)
+# The pages whose sizes the bot corrects: the Markdown at the top of the repository
+# and in docs/, as pathspecs of git.
+PAGES = (":(glob)*.md", ":(glob)docs/**/*.md")
+# A picture of Markdown that has attributes, with a text that may hold brackets one
+# deep and an optional title, such as ![A](a.png "B"){ width="1600" height="900" }.
+MARKDOWN_PICTURE = re.compile(
+    r"(?P<shown>!\[(?:[^\[\]]|\[[^\]]*\])*\]"
+    r"\(\s*<?(?P<address>[^\s<>)]+)>?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\))"
+    r"(?P<attributes>\{[^{}\n]*\})"
+)
+# A picture of HTML, on one line or several, whose attributes may hold a >.
+HTML_PICTURE = re.compile(r"""<img\b(?:[^<>"']|"[^"]*"|'[^']*')*>""", re.IGNORECASE)
+# An attribute of either: a quoted value counts as a whole, so that a width in the text
+# of a picture stays text.
+ATTRIBUTE = re.compile(
+    r"""(?P<lead>(?P<name>[\w:.-]+)\s*=\s*)(?P<value>"[^"]*"|'[^']*'|[^\s"'<>{}]+)"""
+)
+# The branch of a picture that a page shows from main of its own repository, as
+# .github/mkdocs_blueprint.py reads such an address for the website.
+BRANCHES = ("main", "HEAD")
+ORIGIN = re.compile(r"github\.com[:/](?P<repository>[^/\s]+/[^/\s]+?)(?:\.git)?/?$")
+
+
+@dataclass(frozen=True)
+class Picture:
+    """A picture that the script changed: its path, whether it is new, changed or
+    deleted, the share of its pixels that changed, when the two have the same size
+    and number of frames, and the size of the committed file when the new one has
+    another. A file besides pictures that the settings name is of the kind file,
+    with neither. diff is where the folder of keep holds the picture of the
+    difference, of a changed picture of the same size and frames that keep could
+    read, and comparison where it holds the place of the change before and after in
+    one picture, of the frame numbered frame, from 1, of the frames of the picture.
+
+    A changed picture of the same size and frames also says what keep measured:
+    pixels, how many pixels changed in all its frames, box, where they changed in the
+    frame that the comparison shows, seen, whether that is above the threshold of
+    sight, and all_over, whether its changes lie all over the picture, so that no
+    frame marks them. A picture below the threshold keeps its file, and the report
+    names it apart, under unseen, with what differs at all: share and pixels of every
+    pixel that differs, and box around them in all frames."""
+
+    path: str
+    status: str
+    share: float | None = None
+    before: Size | None = None
+    kind: str = "picture"
+    diff: str | None = None
+    comparison: str | None = None
+    frame: int | None = None
+    frames: int | None = None
+    pixels: int | None = None
+    box: Box | None = None
+    seen: bool | None = None
+    all_over: bool = False
+
+
+@dataclass(frozen=True)
+class Settings:
+    """What .github/screenshots.toml sets: the shards that render side by side, the
+    files besides pictures that the bot commits, the hosts that the jobs that render
+    may reach and those of them that they don't wait for, the time limit of the
+    script in minutes and the folder that a failed render keeps. Each stays empty
+    without the file."""
+
+    shards: tuple[str, ...] = ()
+    files: tuple[str, ...] = ()
+    hosts: tuple[str, ...] = ()
+    skip_wait: tuple[str, ...] = ()
+    timeout_minutes: int | None = None
+    failure_folder: str = ""
+
+
+@dataclass(frozen=True)
+class Kept:
+    """What keep left for the pull request: the pictures by their paths, and the
+    other files that the script changed, which the bot leaves out, and the pictures
+    whose pixels differ only below the threshold of sight, which keep their files."""
+
+    pictures: tuple[Picture, ...]
+    ignored: tuple[str, ...] = ()
+    unseen: tuple[Picture, ...] = ()
+
+
+@dataclass(frozen=True)
+class Correction:
+    """A size that a page named for a picture, and the size that it names now."""
+
+    picture: str
+    named: Size
+    fitted: Size
+
+
+@dataclass(frozen=True)
+class Page:
+    """A page whose named sizes the bot corrected: its path, its content with the new
+    numbers, and each correction."""
+
+    path: str
+    data: bytes
+    corrections: tuple[Correction, ...]
+
+
+def git(root: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        capture_output=True,
+        check=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout
+
+
+def committed(root: Path, path: str) -> bytes:
+    """The file at path as the commit of the work tree has it."""
+    return subprocess.run(
+        ["git", "show", f"HEAD:{path}"], cwd=root, capture_output=True, check=True
+    ).stdout
+
+
+def is_plain(path: str) -> bool:
+    """Whether a path has only plain names, so that it stays in the repository."""
+    return all(PART.fullmatch(part.removeprefix(".")) for part in path.split("/"))
+
+
+def is_picture(path: str) -> bool:
+    """Whether the bot may write a file: a picture by its ending, by a path of plain
+    names that stays in the repository, out of .git and of the workflows."""
+    if not is_plain(path):
+        return False
+    if path.split("/")[0] == ".git" or path.startswith(".github/workflows/"):
+        return False
+    return Path(path).suffix.lower() in SIGNATURES
+
+
+def refused_file(path: str) -> str:
+    """Why the bot may not commit a file besides pictures that the settings name, or
+    nothing for one by a path of plain names, outside .git and .github, that is no
+    picture, which the bot takes anyway."""
+    if not is_plain(path):
+        return "is no path of plain names in the repository"
+    if path.split("/")[0] in CLOSED:
+        return (
+            "is in .git or .github, which hold the history, the workflows and the "
+            "settings, never a file that a script renders"
+        )
+    if Path(path).suffix.lower() in SIGNATURES:
+        return "is a picture, which the bot takes anyway"
+    return ""
+
+
+def listed(data: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:
+    """A list of strings of the settings, in its order, with none named twice."""
+    value = data.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{where}: {key} is a list of strings.")
+    twice = [item for index, item in enumerate(value) if item in value[:index]]
+    if twice:
+        raise ValueError(f"{where}: {key} names {twice[0]} twice.")
+    return tuple(value)
+
+
+def settings(root: Path, path: Path = SETTINGS) -> Settings:
+    """The settings of the screenshot bot in the file at path, checked: each shard a
+    plain name, each file one that the bot may commit, each host as Harden-Runner
+    allows it and each that the jobs don't wait for one of those, the time limit a
+    whole number of minutes within that of the job, and the folder of a failure one of
+    plain names outside .git. Raises ValueError for anything else, a key that the bot
+    doesn't know too, so that a typo never drops a host or a shard without a word."""
+    file = root / path
+    if not file.is_file():
+        return Settings()
+    where = path.as_posix()
+    try:
+        data = tomllib.loads(file.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"{where} is no TOML that the bot can read: {error}") from None
+    unknown = sorted(set(data) - set(KEYS))
+    if unknown:
+        raise ValueError(
+            f"{where} sets {unknown[0]}, which the bot doesn't know; it knows "
+            f"{', '.join(KEYS[:-1])} and {KEYS[-1]}."
+        )
+    shards = listed(data, "shards", where)
+    for shard in shards:
+        if not SHARD.fullmatch(shard):
+            raise ValueError(
+                f"{where}: the shard {shard!r} is no plain name of letters, digits, "
+                "dots, underscores and hyphens, up to 64 from a letter or a digit."
+            )
+    if len(shards) > MOST_SHARDS:
+        raise ValueError(
+            f"{where} names {len(shards)} shards, more than the {MOST_SHARDS} jobs "
+            "that one matrix of GitHub Actions runs."
+        )
+    files = listed(data, "files", where)
+    for name in files:
+        reason = refused_file(name)
+        if reason:
+            raise ValueError(f"{where}: the file {name!r} {reason}.")
+    hosts = listed(data, "hosts", where)
+    for host in hosts:
+        found = HOST.fullmatch(host)
+        if not found or not 0 < int(found["port"]) < 65536:
+            raise ValueError(
+                f"{where}: the host {host!r} is no host and port as Harden-Runner "
+                "allows it, such as ghcr.io:443 or *.data.mcr.microsoft.com:443, in "
+                "small letters."
+            )
+    skip_wait = listed(data, "skip_wait", where)
+    for host in skip_wait:
+        if host not in hosts:
+            raise ValueError(
+                f"{where}: skip_wait names {host!r}, which hosts doesn't name; the "
+                "jobs leave out of their wait only a host of the project."
+            )
+    return Settings(
+        shards,
+        files,
+        hosts,
+        skip_wait,
+        time_limit(data, where),
+        failure_folder(data, where),
+    )
+
+
+def time_limit(data: Mapping[str, Any], where: str) -> int | None:
+    """The time limit of the script in the settings, in whole minutes within that of
+    the job, or nothing when they give none."""
+    minutes = data.get("timeout_minutes")
+    if minutes is None:
+        return None
+    # TOML's true and false are numbers to Python.
+    if isinstance(minutes, bool) or not isinstance(minutes, int):
+        raise ValueError(f"{where}: timeout_minutes is a whole number of minutes.")
+    if not 0 < minutes <= MOST_MINUTES:
+        raise ValueError(
+            f"{where}: timeout_minutes is {minutes}, but the script may take from 1 "
+            f"to {MOST_MINUTES} minutes, so that the steps after it in the job of "
+            f"{JOB_MINUTES} still keep what it left."
+        )
+    return minutes
+
+
+def failure_folder(data: Mapping[str, Any], where: str) -> str:
+    """The folder that a failed render keeps as an artifact, by a path of plain names
+    in the repository outside .git, or nothing when the settings name none."""
+    folder = data.get("failure_folder", "")
+    if not isinstance(folder, str):
+        raise ValueError(f"{where}: failure_folder is a string.")
+    if folder and (not is_plain(folder) or folder.split("/")[0] == ".git"):
+        raise ValueError(
+            f"{where}: the failure_folder {folder!r} is no path of plain names in the "
+            "repository outside .git, such as tests/e2e/artifacts."
+        )
+    return folder
+
+
+def plan(found: Settings) -> str:
+    """The outputs of the job that starts a render, as lines of $GITHUB_OUTPUT: the
+    shards as the matrix of the job render, one job named all for a project that
+    names none; whether Harden-Runner blocks every host but those of the jobs and of
+    the settings, or, without hosts, only records the traffic, and the hosts that the
+    jobs don't wait for; the time limit of the script, the most that the settings may
+    give when they give none, so that a hung script fails its step before the job
+    runs out of time and the folder of the failure is kept; and the folder that a failed render keeps, if any."""
+    shards = [{"shard": shard, "id": shard} for shard in found.shards] or [
+        {"shard": "", "id": WHOLE}
+    ]
+    return (
+        f"shards={json.dumps(shards, separators=(',', ':'))}\n"
+        f"policy={'block' if found.hosts else 'audit'}\n"
+        f"hosts={' '.join(found.hosts)}\n"
+        f"skip_wait={' '.join(found.skip_wait)}\n"
+        f"timeout_minutes={found.timeout_minutes or MOST_MINUTES}\n"
+        f"failure_folder={found.failure_folder}\n"
+    )
+
+
+def looks_like_its_kind(path: str, data: bytes) -> bool:
+    """Whether a file starts as a picture of its ending does."""
+    suffix = Path(path).suffix.lower()
+    if suffix == ".webp" and data[8:12] != b"WEBP":
+        return False
+    if suffix == ".mp4":
+        data = data[4:]
+    return data.startswith(SIGNATURES[suffix])
+
+
+def png_size(data: bytes) -> tuple[int, ...]:
+    return struct.unpack(">II", data[16:24]) if data[12:16] == b"IHDR" else ()
+
+
+def gif_size(data: bytes) -> tuple[int, ...]:
+    return struct.unpack("<HH", data[6:10])
+
+
+def jpeg_size(data: bytes) -> tuple[int, ...]:
+    """The size in the first frame header of a JPEG, past the segments before it. A
+    file that ends first, or holds no marker where one belongs, has none."""
+    at = 2
+    while data[at] == 0xFF:
+        marker = data[at + 1]
+        # The frame headers of every kind of JPEG; C4, C8 and CC only look like them.
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height, width = struct.unpack(">HH", data[at + 5 : at + 9])
+            return width, height
+        at += 2 + struct.unpack(">H", data[at + 2 : at + 4])[0]
+    return ()
+
+
+def webp_size(data: bytes) -> tuple[int, ...]:
+    """The size in the first chunk of the three kinds of WebP: lossy, lossless, and
+    extended, such as an animation."""
+    chunk = data[12:16]
+    if chunk == b"VP8 ":
+        width, height = struct.unpack("<HH", data[26:30])
+        return width & 0x3FFF, height & 0x3FFF
+    # The two others read fewer bytes as a smaller number without complaint.
+    if len(data) < 30:
+        return ()
+    if chunk == b"VP8L":
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, (bits >> 14 & 0x3FFF) + 1
+    if chunk == b"VP8X":
+        width = int.from_bytes(data[24:27], "little") + 1
+        return width, int.from_bytes(data[27:30], "little") + 1
+    return ()
+
+
+SIZE_READERS = {
+    ".png": png_size,
+    ".jpg": jpeg_size,
+    ".jpeg": jpeg_size,
+    ".gif": gif_size,
+    ".webp": webp_size,
+}
+
+
+def picture_size(path: str, data: bytes) -> Size | None:
+    """The width and the height that a picture names in its header, read without
+    Pillow, which the job with the release app doesn't have: its file comes from a job
+    that ran the script of the project, so a file that names none, or none that makes
+    sense, simply has no size. A video has none here either."""
+    reader = SIZE_READERS.get(Path(path).suffix.lower())
+    if reader is None or not looks_like_its_kind(path, data):
+        return None
+    try:
+        found = reader(data)
+    except (IndexError, struct.error):
+        return None
+    if len(found) != 2 or not all(found):
+        return None
+    return found[0], found[1]
+
+
+def patterns(
+    root: Path, paths: Path = PATHS, script: Path = SCRIPT, config: Path = SETTINGS
+) -> list[str]:
+    """The patterns of the files whose change can change the pictures: those of the
+    list, one on each line, without its comments and empty lines, and always the
+    script, the list itself and the settings, whose shards, files and hosts a render
+    tries out. A pattern that starts with ! leaves files out."""
+    found = [script.as_posix(), paths.as_posix(), config.as_posix()]
+    listed = root / paths
+    if listed.is_file():
+        for line in listed.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                found.append(line)
+    return found
+
+
+def pathspec(pattern: str) -> str:
+    """A pattern of the list as a pathspec of git: * stays within a folder, ** goes
+    through folders, and a folder takes everything in it, as the paths of a
+    workflow do."""
+    if pattern.startswith("!"):
+        return f":(glob,exclude){pattern[1:]}"
+    return f":(glob){pattern}"
+
+
+def due(
+    root: Path,
+    since: str = "",
+    until: str = "HEAD",
+    paths: Path = PATHS,
+    script: Path = SCRIPT,
+) -> tuple[bool, str]:
+    """Whether the bot renders, and why: never without the script; after a change,
+    since..until, only when it touches a file of the list; otherwise always."""
+    if not (root / script).is_file():
+        return False, (
+            f"The repository has no `{script.as_posix()}`, so the bot renders no "
+            "pictures; adding the script turns it on."
+        )
+    if not since:
+        return True, f"The bot renders the pictures with `{script.as_posix()}`."
+    specs = [pathspec(pattern) for pattern in patterns(root, paths, script)]
+    changed = git(
+        root, "diff", "--name-only", "--no-renames", since, until, "--", *specs
+    ).split()
+    if not changed:
+        return False, (
+            "The change touches no file of the list "
+            f"`{paths.as_posix()}`, so the pictures stay as they are."
+        )
+    named = ", ".join(f"`{path}`" for path in changed[:5])
+    more = f" and {len(changed) - 5} more" if len(changed) > 5 else ""
+    return True, f"The change touches {named}{more}, so the bot renders the pictures."
+
+
+def frames(data: bytes) -> list[tuple[tuple[int, int], bytes]]:
+    """The frames of a picture as their sizes and pixels, those of an animation in
+    their order, without a frame that repeats the one before and without the time
+    each frame shows: a recording that waited a moment longer looks the same. A
+    pixel that is fully transparent counts as one, whatever its color."""
+    from PIL import Image, ImageSequence
+
+    found: list[tuple[tuple[int, int], bytes]] = []
+    with Image.open(io.BytesIO(data)) as image:
+        for frame in ImageSequence.Iterator(image):
+            pixels = frame.convert("RGBA").convert("RGBa").tobytes()
+            if not found or found[-1] != (frame.size, pixels):
+                found.append((frame.size, pixels))
+    return found
+
+
+Frames = list[tuple[tuple[int, int], bytes]]
+Pairs = list[tuple[Size, bytes, bytes]]
+
+
+@dataclass(frozen=True)
+class Most:
+    """The pair of frames of two pictures with the most changed pixels: their size,
+    their pixels before and after, as frames reads them, the mask of the changes, the
+    number of the frame, from 1, and how many frames each picture has, as frames
+    counts them."""
+
+    size: Size
+    before: bytes
+    after: bytes
+    mask: Image.Image
+    frame: int
+    frames: int
+
+
+@dataclass(frozen=True)
+class Measured:
+    """What a comparison of the frames of two pictures measured: the share of their
+    pixels that changed above the threshold of sight, how many pixels that is in all
+    frames, and the pair of frames with the most of them, or None without any; and
+    how many pixels differ at all, also below the threshold, with the box around them
+    in all frames, or None when none does, and how many pixels the frames have."""
+
+    share: float
+    pixels: int
+    most: Most | None
+    differing: int
+    spread: Box | None
+    total: int
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """The place of the change of a picture before and after, as a PNG, of the frame
+    numbered frame, from 1, of the frames of the picture."""
+
+    picture: bytes
+    frame: int
+    frames: int
+
+
+def compared(before: bytes, after: bytes) -> Pairs | None:
+    """The frames of two pictures side by side, as the size of each pair and the
+    pixels of the frame before and after, or None when their sizes or numbers of
+    frames differ."""
+    return paired(frames(before), frames(after))
+
+
+def paired(old: Frames, new: Frames) -> Pairs | None:
+    """The frames of two pictures that frames read, side by side as compared gives
+    them, or None when their sizes or numbers of frames differ."""
+    if len(old) != len(new) or any(a[0] != b[0] for a, b in zip(old, new, strict=True)):
+        return None
+    return [(size, a, b) for (size, a), (_, b) in zip(old, new, strict=True)]
+
+
+def strongest(image: Image.Image) -> Image.Image:
+    """The largest value of each pixel of a picture over its bands, as a picture of
+    one band."""
+    from PIL import ImageChops
+
+    bands = image.split()
+    most = bands[0]
+    for band in bands[1:]:
+        most = ImageChops.lighter(most, band)
+    return most
+
+
+def above(values: Image.Image, threshold: int) -> Image.Image:
+    """A mask of the values of a picture of one band: 255 where a value is above
+    threshold, 0 elsewhere."""
+    return values.point([0] * (threshold + 1) + [255] * (255 - threshold))
+
+
+def greatest(image: Image.Image) -> Image.Image:
+    """The greatest value of each band of a picture at each place and its eight
+    neighbors, with nothing beyond the edges: as MaxFilter(3), but in a few steps of
+    Pillow that each take a moment, where MaxFilter sorts every place."""
+    from PIL import ImageChops
+
+    width, height = image.size
+    across = image
+    for step in (-1, 1):
+        # A box that reaches beyond the picture fills it with 0, which adds nothing
+        # to a greatest value.
+        across = ImageChops.lighter(across, image.crop((step, 0, width + step, height)))
+    found = across
+    for step in (-1, 1):
+        found = ImageChops.lighter(found, across.crop((0, step, width, height + step)))
+    return found
+
+
+def beyond(pixels: Image.Image, around: Image.Image, threshold: int) -> Image.Image:
+    """A mask of the pixels of a frame whose color lies beyond the colors around the
+    same place in another frame: 255 where a band of a pixel of pixels lies more than
+    threshold below the least or above the greatest value of that band at the same
+    place and its eight neighbors in around, 0 elsewhere."""
+    from PIL import ImageChops
+
+    least = ImageChops.invert(greatest(ImageChops.invert(around)))
+    below = strongest(ImageChops.subtract(least, pixels))
+    over = strongest(ImageChops.subtract(pixels, greatest(around)))
+    return above(ImageChops.lighter(below, over), threshold)
+
+
+def moved(old: Image.Image, new: Image.Image, threshold: int) -> Image.Image:
+    """A mask of the places where either of two frames lies beyond the other, as
+    beyond finds it with threshold."""
+    from PIL import ImageChops
+
+    return ImageChops.lighter(beyond(new, old, threshold), beyond(old, new, threshold))
+
+
+def differences(size: Size, first: bytes, second: bytes) -> Image.Image:
+    """How far each pixel of two frames of one size differs, as the largest
+    difference of its bands, in a picture of one band."""
+    from PIL import Image, ImageChops
+
+    return strongest(
+        ImageChops.difference(
+            Image.frombytes("RGBA", size, first), Image.frombytes("RGBA", size, second)
+        )
+    )
+
+
+def changed_pixels(size: Size, first: bytes, second: bytes) -> Image.Image:
+    """The pixels that changed between two frames of one size so that one sees it, as
+    a mask: 255 where a pixel of either frame lies beyond the colors around it in the
+    other, as beyond finds it with TOLERANCE, and the average of the three by three
+    pixels around it lies beyond the averages around it in the other, as beyond finds
+    it with AVERAGE; 0 where it stayed or changed below the threshold of sight. Only
+    a pixel that differs by more than TOLERANCE can lie beyond, so this looks only at
+    the box around those, with two pixels more on each side: the averages of their
+    neighbors take the pixels next to those."""
+    from PIL import Image, ImageChops, ImageFilter
+
+    candidates = above(differences(size, first, second), TOLERANCE)
+    mask = Image.new("L", size)
+    box = candidates.getbbox()
+    if box is None:
+        return mask
+    width, height = size
+    left, top, right, bottom = box
+    near = (
+        max(0, left - 2),
+        max(0, top - 2),
+        min(width, right + 2),
+        min(height, bottom + 2),
+    )
+    old = Image.frombytes("RGBA", size, first).crop(near)
+    new = Image.frombytes("RGBA", size, second).crop(near)
+    blurred = ImageFilter.BoxBlur(1)
+    seen = ImageChops.darker(
+        moved(old, new, TOLERANCE),
+        moved(old.filter(blurred), new.filter(blurred), AVERAGE),
+    )
+    mask.paste(seen, near[:2])
+    return mask
+
+
+def differing_pixels(size: Size, first: bytes, second: bytes) -> Image.Image:
+    """The pixels that differ at all between two frames of one size, as a mask: 255
+    where a pixel differs, 0 where it is the same."""
+    return above(differences(size, first, second), 0)
+
+
+def changed_share(before: bytes, after: bytes) -> float | None:
+    """The share of the pixels that changed above the threshold of sight, 0 when the
+    pictures look the same, and None when their sizes or numbers of frames
+    differ."""
+    pairs = compared(before, after)
+    return None if pairs is None else changes(pairs).share
+
+
+def changes(pairs: Pairs) -> Measured:
+    """What changed between the frames of pairs, as Measured says: the pair of frames
+    with the most changed pixels is the first of them on a tie. Each mask is counted
+    once."""
+    total = changed = differing = 0
+    most: tuple[int, Most] | None = None
+    spread: list[Box] = []
+    for number, (size, first, second) in enumerate(pairs, 1):
+        total += size[0] * size[1]
+        if first == second:
+            continue
+        differ = differing_pixels(size, first, second)
+        differing += differ.histogram()[255]
+        spread.append(differ.getbbox() or (0, 0, 0, 0))
+        mask = changed_pixels(size, first, second)
+        count = mask.histogram()[255]
+        changed += count
+        if count and (most is None or count > most[0]):
+            most = (count, Most(size, first, second, mask, number, len(pairs)))
+    return Measured(
+        changed / total,
+        changed,
+        None if most is None else most[1],
+        differing,
+        joined_box(spread) if spread else None,
+        total,
+    )
+
+
+def joined_box(boxes: Sequence[Box]) -> Box:
+    """The box around boxes."""
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+
+def scaled(length: int, longest: int) -> int:
+    """A length of a picture shown SHOWN pixels wide at its longer side, in the pixels
+    of a picture whose longer side is longest, at least one."""
+    return max(1, -(-length * longest // SHOWN))
+
+
+def marks(most: Most) -> list[Box] | None:
+    """The boxes of changes that the frames of a difference and a comparison mark, as
+    regions groups them in a picture shown SHOWN pixels wide, those whose frames would
+    touch joined, and more than MOST_MARKS of them joined into one, or None when the
+    picture changed all over: when the frames would cover more than ALL_OVER of the
+    picture, or the changes fall into more than MOST_REGIONS groups."""
+    width, height = most.size
+    longest = max(most.size)
+    boxes = regions(most.mask, scaled(NEAR, longest))
+    if len(boxes) > MOST_REGIONS:
+        return None
+    away = scaled(MARGIN, longest) + scaled(FRAME, longest)
+    boxes = touching(boxes, 2 * away)
+    if len(boxes) > MOST_MARKS:
+        boxes = [joined_box(boxes)]
+
+    def covered(boxes: Sequence[Box]) -> int:
+        return sum(
+            (min(width, right + away) - max(0, left - away))
+            * (min(height, bottom + away) - max(0, top - away))
+            for left, top, right, bottom in boxes
+        )
+
+    return None if covered(boxes) > ALL_OVER * width * height else boxes
+
+
+def touching(boxes: Sequence[Box], gap: int) -> list[Box]:
+    """Boxes with each two that are less than gap pixels apart joined into the box
+    around both, until no two are."""
+    found = list(boxes)
+    joined = True
+    while joined:
+        joined = False
+        for first, second in itertools.combinations(range(len(found)), 2):
+            a, b = found[first], found[second]
+            apart = max(b[0] - a[2], a[0] - b[2], b[1] - a[3], a[1] - b[3])
+            if apart < gap:
+                found[first] = joined_box((a, b))
+                del found[second]
+                joined = True
+                break
+    return sorted(found)
+
+
+def regions(mask: Image.Image, near: int) -> list[tuple[int, int, int, int]]:
+    """The boxes around the changes of a mask, as getbbox gives them: the changed
+    pixels in squares of near pixels, each square with those that touch it, also at a
+    corner, so that changes nearer to each other than about near share a box."""
+    width, height = mask.size
+    boxes: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    for top in range(0, height, near):
+        for left in range(0, width, near):
+            box = mask.crop((left, top, left + near, top + near)).getbbox()
+            if box:
+                boxes[left // near, top // near] = (
+                    left + box[0],
+                    top + box[1],
+                    left + box[2],
+                    top + box[3],
+                )
+    found = []
+    while boxes:
+        square, box = boxes.popitem()
+        group, joined = [square], [box]
+        for x, y in group:
+            for side in [(x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]:
+                if side in boxes:
+                    group.append(side)
+                    joined.append(boxes.pop(side))
+        found.append(
+            (
+                min(b[0] for b in joined),
+                min(b[1] for b in joined),
+                max(b[2] for b in joined),
+                max(b[3] for b in joined),
+            )
+        )
+    return sorted(found)
+
+
+def most_changed(before: bytes, after: bytes) -> Most | None:
+    """The pair of frames of two pictures with the most changed pixels, as changes
+    finds it, or None when their sizes or numbers of frames differ or no pixel
+    changed."""
+    pairs = compared(before, after)
+    return None if pairs is None else changes(pairs).most
+
+
+def difference(before: bytes, after: bytes) -> bytes | None:
+    """A picture of what changed between two pictures of the same size and frames, as
+    a PNG: each changed pixel in red over the new picture in its own colors behind a
+    thin veil of its own average color, of the pair of frames with the most changed
+    pixels for an animation. A red frame around each place of change, as marks finds
+    them, keeps a change of a single pixel in sight when a phone shows the picture
+    scaled down to about SHOWN pixels wide; a picture that changed all over gets no
+    frame. None when the sizes or numbers of frames differ or no pixel changed above
+    the threshold of sight."""
+    most = most_changed(before, after)
+    return None if most is None else drawing(most)
+
+
+def comparison(before: bytes, after: bytes) -> Comparison | None:
+    """The place where two pictures of the same size and frames differ, before and
+    after in one picture, as side_by_side draws it, of the pair of frames with the
+    most changed pixels for an animation, with the number of that frame and how many
+    frames the pictures have. None when the sizes or numbers of frames differ or no
+    pixel changed."""
+    most = most_changed(before, after)
+    if most is None:
+        return None
+    return Comparison(side_by_side(most), most.frame, most.frames)
+
+
+def flattened(size: Size, pixels: bytes) -> Image.Image:
+    """A frame, as frames reads it, on white, in RGB: a transparent pixel is white."""
+    from PIL import Image
+
+    shown = Image.new("RGBA", size, "white")
+    shown.alpha_composite(Image.frombytes("RGBa", size, pixels).convert("RGBA"))
+    return shown.convert("RGB")
+
+
+def framed(
+    image: Image.Image,
+    boxes: Sequence[tuple[int, int, int, int]],
+    longest: int,
+    at: tuple[int, int] = (0, 0),
+) -> None:
+    """Draws a red frame around each box of changes on image, whose top left corner is
+    at that place of the picture of the boxes, as wide and as far from its changes as
+    FRAME and MARGIN for a picture shown SHOWN pixels wide at its longest side."""
+    from PIL import ImageDraw
+
+    frame, margin = scaled(FRAME, longest), scaled(MARGIN, longest)
+    away = margin + frame
+    draw = ImageDraw.Draw(image)
+    for left, top, right, bottom in boxes:
+        draw.rectangle(
+            (
+                left - at[0] - away,
+                top - at[1] - away,
+                right - 1 - at[0] + away,
+                bottom - 1 - at[1] + away,
+            ),
+            outline=RED,
+            width=frame,
+        )
+
+
+def png_of(image: Image.Image) -> bytes:
+    out = io.BytesIO()
+    image.save(out, "PNG")
+    return out.getvalue()
+
+
+def drawing(most: Most) -> bytes:
+    """The picture of the difference that difference draws, of the pair of frames
+    that changes found with the most changed pixels."""
+    from PIL import Image
+
+    shown = flattened(most.size, most.after)
+    average = shown.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
+    drawn = Image.blend(shown, Image.new("RGB", most.size, average), VEIL)
+    drawn.paste(RED, mask=most.mask)
+    framed(drawn, marks(most) or (), max(most.size))
+    return png_of(drawn)
+
+
+def span(low: int, high: int, length: int, room: int, least: int) -> tuple[int, int]:
+    """The part of a side of a picture length pixels long that a comparison shows of
+    changes from low up to high: with room on both ends, at least least pixels long,
+    around the changes in its middle, moved inside the picture where it would leave
+    it, and never longer than the picture."""
+    low, high = low - room, high + room
+    missing = least - (high - low)
+    if missing > 0:
+        low, high = low - missing // 2, high + missing - missing // 2
+    shift = max(0, -low) - max(0, high - length)
+    return max(0, low + shift), min(length, high + shift)
+
+
+def fits_beside(width: int, height: int) -> bool:
+    """Whether a phone held upright shows two places of width and height larger side
+    by side than one above the other."""
+    side, upright = PHONE
+
+    def shown(across: int, down: int) -> float:
+        return min(side / across, upright / down)
+
+    return shown(2 * width, height) >= shown(width, 2 * height)
+
+
+def side_by_side(most: Most) -> bytes:
+    """The comparison of the pair of frames that changes found with the most changed
+    pixels, as a PNG: the place of the changes before and after, cut to the changes
+    with ROOM around them and at least CONTEXT of each side, in the colors of the
+    pictures and at their size in pixels, so that their text stays as readable as in
+    the pictures. The two stand side by side, or one above the other for a wide
+    place, whichever a phone shows larger, the one before first, with an arrow
+    between them, and each change has the same red frame on both, as marks finds
+    them, or none for a picture that changed all over."""
+    from PIL import Image, ImageDraw
+
+    width, height = most.size
+    longest = max(most.size)
+    room, least = scaled(ROOM, longest), scaled(CONTEXT, longest)
+    left, top, right, bottom = most.mask.getbbox() or (0, 0, width, height)
+    x0, x1 = span(left, right, width, room, least)
+    y0, y1 = span(top, bottom, height, room, least)
+    across, down = x1 - x0, y1 - y0
+    beside = fits_beside(across, down)
+    shown = max(2 * across, down) if beside else max(across, 2 * down)
+    gap = scaled(GAP, shown)
+    if beside:
+        size, second = (2 * across + gap, down), (across + gap, 0)
+    else:
+        size, second = (across, 2 * down + gap), (0, down + gap)
+    drawn = Image.new("RGB", size, STRIP)
+    boxes = marks(most) or ()
+    for pixels, at in ((most.before, (0, 0)), (most.after, second)):
+        part = flattened(most.size, pixels).crop((x0, y0, x1, y1))
+        framed(part, boxes, shown, (x0, y0))
+        drawn.paste(part, at)
+    # The arrow points from the place before to the place after, in the middle of the
+    # strip between them.
+    half = max(1, gap * 3 // 10)
+    if beside:
+        middle = (across + gap / 2, down / 2)
+        tip = [(-half, -2 * half), (-half, 2 * half), (half, 0)]
+    else:
+        middle = (across / 2, down + gap / 2)
+        tip = [(-2 * half, -half), (2 * half, -half), (0, half)]
+    ImageDraw.Draw(drawn).polygon(
+        [(middle[0] + x, middle[1] + y) for x, y in tip], fill=ARROW
+    )
+    return png_of(drawn)
+
+
+def diff_path(path: str) -> str:
+    """Where keep puts the picture of the difference of the picture at path, in its
+    folder: under diff/ at its path, as a PNG, whose name ends in .png."""
+    return f"diff/{path}" + ("" if path.lower().endswith(".png") else ".png")
+
+
+def comparison_path(path: str) -> str:
+    """Where keep puts the comparison of the picture at path, in its folder: under
+    comparison/ at its path, as a PNG, whose name ends in .png."""
+    return "comparison/" + diff_path(path).removeprefix("diff/")
+
+
+def same_pixels(before: bytes, after: bytes) -> bool:
+    """Whether two pictures look the same: the same frames with the same pixels. A
+    file that is no picture Pillow can read differs from every other."""
+    if before == after:
+        return True
+    try:
+        return frames(before) == frames(after)
+    except (OSError, ValueError):
+        return False
+
+
+def still_videos(root: Path, pictures: list[Picture]) -> list[Picture]:
+    """The pictures without each changed NAME.mp4 whose NAME.gif kept its pixels,
+    which gets its committed file back.
+
+    The script records the video again on each run, and its bytes differ with the
+    time that each step of the recording took, while the GIF of the same recording
+    looks the same; the video shows what that GIF shows.
+    """
+    shown = {picture.path for picture in pictures if picture.status != "deleted"}
+    left = []
+    for picture in pictures:
+        path = Path(picture.path)
+        gif = path.with_suffix(".gif").as_posix()
+        if (
+            picture.status == "changed"
+            and path.suffix.lower() == ".mp4"
+            and gif not in shown
+            and (root / gif).is_file()
+        ):
+            (root / path).write_bytes(committed(root, picture.path))
+            continue
+        left.append(picture)
+    return left
+
+
+def size_before(path: str, before: bytes, after: bytes) -> Size | None:
+    """The size of a picture before the script changed it, when it has another now."""
+    old = picture_size(path, before)
+    return old if old != picture_size(path, after) else None
+
+
+def kind_of(path: str, files: Sequence[str] = ()) -> str:
+    """How the bot takes a path that the script changed: as a picture, as a file
+    besides pictures that the settings name, or, with nothing, not at all."""
+    if is_picture(path):
+        return "picture"
+    if path in files and not refused_file(path):
+        return "file"
+    return ""
+
+
+def is_text(data: bytes) -> bool:
+    """Whether a file is text in UTF-8, which a pull request shows line by line."""
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def store(
+    folder: Path,
+    found: Kept,
+    read: Callable[[str], bytes],
+    drawn: Callable[[str], bytes],
+) -> None:
+    """Writes what keep or collect found into folder, for the screenshot bot: each new
+    or changed picture or file under files/ at its path, as read gives it for the
+    path, the picture of each difference at its diff and each comparison at its
+    comparison, as drawn gives them for that place, the paths of the deleted ones in
+    deleted.txt and the list of all with their changes in report.json, with the
+    pictures below the threshold of sight apart, under unseen. The bot commits
+    nothing of diff/ and comparison/: they are there for people, in the artifact of
+    the run."""
+    # Also when the script only deleted pictures, which leaves nothing to copy.
+    folder.mkdir(parents=True, exist_ok=True)
+    for picture in found.pictures:
+        targets = []
+        if picture.status != "deleted":
+            targets.append((f"files/{picture.path}", read(picture.path)))
+        targets += [
+            (name, drawn(name)) for name in (picture.diff, picture.comparison) if name
+        ]
+        for name, data in targets:
+            (folder / name).parent.mkdir(parents=True, exist_ok=True)
+            (folder / name).write_bytes(data)
+    deleted = [p.path for p in found.pictures if p.status == "deleted"]
+    if deleted:
+        (folder / "deleted.txt").write_text(
+            "".join(f"{path}\n" for path in deleted), encoding="utf-8", newline="\n"
+        )
+    (folder / REPORT).write_text(
+        json.dumps(
+            {
+                "pictures": [
+                    {
+                        "path": p.path,
+                        "status": p.status,
+                        "share": p.share,
+                        "before": p.before,
+                        "diff": p.diff,
+                        "comparison": p.comparison,
+                        "frame": p.frame,
+                        "frames": p.frames,
+                        "pixels": p.pixels,
+                        "box": p.box,
+                        "seen": p.seen,
+                        "all_over": p.all_over,
+                    }
+                    for p in found.pictures
+                ],
+                "ignored": list(found.ignored),
+                "unseen": [
+                    {
+                        "path": p.path,
+                        "share": p.share,
+                        "pixels": p.pixels,
+                        "box": p.box,
+                        "seen": False,
+                    }
+                    for p in found.unseen
+                ],
+            },
+            indent=1,
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def keep(root: Path, folder: Path | None = None, files: Sequence[str] = ()) -> Kept:
+    """Compares each picture that the script changed in the work tree with the one
+    that the commit has, by its pixels: one that looks the same gets the committed
+    file back. A file of files, besides pictures, which the settings name, counts as
+    changed when its bytes do, and has to be text in UTF-8. Copies what is left into
+    folder, when there is one, for the screenshot bot, as store writes it, with a
+    picture of the difference of each changed picture that kept its size and frames.
+    A picture whose pixels differ only below the threshold of sight looks the same
+    too, and Kept names it under unseen, with what differs. The folder stays away
+    when nothing changed that one sees, so report.json names the unseen pictures only
+    beside a change: without one, only the summary of the run names them."""
+    status = git(
+        root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--no-renames",
+        "--untracked-files=all",
+    )
+    pictures: list[Picture] = []
+    ignored: list[str] = []
+    unseen: list[Picture] = []
+    drawings: dict[str, bytes] = {}
+    for entry in filter(None, status.split("\0")):
+        code, path = entry[:2], entry[3:]
+        kind = kind_of(path, files)
+        if not kind:
+            ignored.append(path)
+            continue
+        if not (root / path).is_file():
+            pictures.append(Picture(path, "deleted", kind=kind))
+            continue
+        data = (root / path).read_bytes()
+        if kind == "file":
+            if not is_text(data):
+                raise ValueError(
+                    f"The script wrote {path}, which {SETTINGS.as_posix()} names as "
+                    "a file besides pictures, but which is no text in UTF-8."
+                )
+            status_of = "new" if code == "??" else "changed"
+            pictures.append(Picture(path, status_of, kind=kind))
+            continue
+        if not looks_like_its_kind(path, data):
+            raise ValueError(
+                f"The script wrote {path}, which is no "
+                f"{Path(path).suffix.lower()[1:].upper()} picture."
+            )
+        if code == "??":
+            pictures.append(Picture(path, "new"))
+            continue
+        before = committed(root, path)
+        # Pillow reads both pictures once, for the comparison, the share and the
+        # picture of the difference; a file it can't read differs from every other.
+        read: tuple[Frames, Frames] | None
+        try:
+            read = frames(before), frames(data)
+        except (OSError, ValueError):
+            read = None
+        if before == data or (read is not None and read[0] == read[1]):
+            (root / path).write_bytes(before)
+            continue
+        pairs = None if read is None else paired(*read)
+        measured = None if pairs is None else changes(pairs)
+        if measured is not None and measured.most is None:
+            # What nobody sees is no change: the picture keeps its file.
+            (root / path).write_bytes(before)
+            unseen.append(
+                Picture(
+                    path,
+                    "changed",
+                    measured.differing / measured.total,
+                    pixels=measured.differing,
+                    box=measured.spread,
+                    seen=False,
+                )
+            )
+            continue
+        changed = Picture(path, "changed", None, size_before(path, before, data))
+        if measured is not None and measured.most is not None:
+            most = measured.most
+            changed = replace(
+                changed,
+                share=measured.share,
+                pixels=measured.pixels,
+                box=most.mask.getbbox(),
+                seen=True,
+                all_over=marks(most) is None,
+            )
+            if folder is not None:
+                changed = replace(
+                    changed,
+                    diff=diff_path(path),
+                    comparison=comparison_path(path),
+                    frame=most.frame,
+                    frames=most.frames,
+                )
+                drawings[diff_path(path)] = drawing(most)
+                drawings[comparison_path(path)] = side_by_side(most)
+        pictures.append(changed)
+    pictures = still_videos(root, pictures)
+    pictures.sort(key=lambda picture: picture.path)
+    unseen.sort(key=lambda picture: picture.path)
+    found = Kept(tuple(pictures), tuple(sorted(ignored)), tuple(unseen))
+    if folder is not None and pictures:
+        store(
+            folder, found, lambda path: (root / path).read_bytes(), drawings.__getitem__
+        )
+    return found
+
+
+def reported_size(value: Any) -> Size | None:
+    """A size as the report of a run names it."""
+    if value is None:
+        return None
+    width, height = value
+    return int(width), int(height)
+
+
+def drawn_by_keep(
+    folder: Path, picture: Picture, name: str | None, place: Callable[[str], str]
+) -> bool:
+    """Whether the picture of the difference or the comparison that a report names
+    for a picture, as name, if it names one, is as keep draws it: a PNG at the place
+    of a changed picture, and no link, neither the file nor a folder on its way from
+    folder."""
+    if name is None:
+        return True
+    drawn = folder / name
+    return (
+        picture.status == "changed"
+        and picture.kind == "picture"
+        and name == place(picture.path)
+        and drawn.resolve() == folder.resolve() / name
+        and drawn.is_file()
+        and looks_like_its_kind(name, drawn.read_bytes())
+    )
+
+
+def frame_by_keep(picture: Picture) -> bool:
+    """Whether a report names the frame of a comparison as keep does: the frame, from
+    1, and the number of frames together with the comparison, and neither without."""
+    if picture.comparison is None:
+        return picture.frame is None and picture.frames is None
+    return (
+        picture.frame is not None
+        and picture.frames is not None
+        and 1 <= picture.frame <= picture.frames
+    )
+
+
+def reported_box(value: Any) -> Box | None:
+    """A box as the report of a run names it: four whole numbers, left, top, right
+    and bottom, the last two past the first two."""
+    if value is None:
+        return None
+    match [reported_number(number) for number in value]:
+        case [int(left), int(top), int(right), int(bottom)] if (
+            0 <= left < right and 0 <= top < bottom
+        ):
+            return left, top, right, bottom
+    raise ValueError(f"{value!r} is no box")
+
+
+def reported_flag(value: Any) -> bool | None:
+    """A yes or no as the report of a run names it, which has to be true or false."""
+    if value is None or isinstance(value, bool):
+        return value
+    raise TypeError(f"{value!r} is no true or false")
+
+
+def reported_number(value: Any) -> int | None:
+    """A number as the report of a run names it, which has to be a whole one."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{value!r} is no whole number")
+    return value
+
+
+def kept(folder: Path, files: Sequence[str] = ()) -> Kept:
+    """What a run of keep left in folder, once it is checked: the render job runs the
+    script of the project, so the bot takes nothing but pictures, whose files start
+    as their kind does, and the text of the files of files, which the settings of
+    main name, at the paths of the report, and deletes nothing else. The kind of each
+    comes from its path, never from the run. The picture of a difference and the
+    comparison have to be PNGs at the diff and the comparison of a changed picture,
+    as keep names them, for collect, which copies them, and the comparison comes with
+    its frame. Raises ValueError for anything else."""
+    others = f"no picture and no file that {SETTINGS.as_posix()} names"
+    stored = folder / "files"
+    written = set()
+    for directory, folders, names in os.walk(stored):
+        links = [name for name in folders if Path(directory, name).is_symlink()]
+        for name in sorted(names + links):
+            path = Path(directory, name)
+            relative = path.relative_to(stored).as_posix()
+            kind = "" if path.is_symlink() else kind_of(relative, files)
+            if not kind:
+                raise ValueError(
+                    f"The screenshots of the run hold {relative}, which is {others}."
+                )
+            data = path.read_bytes()
+            if kind == "picture" and not looks_like_its_kind(relative, data):
+                raise ValueError(
+                    f"The screenshots of the run hold {relative}, which is no "
+                    f"{Path(relative).suffix.lower()[1:].upper()} picture."
+                )
+            if kind == "file" and not is_text(data):
+                raise ValueError(
+                    f"The screenshots of the run hold {relative}, which is no text "
+                    "in UTF-8."
+                )
+            written.add(relative)
+    listed = folder / "deleted.txt"
+    deleted = (
+        set(listed.read_text(encoding="utf-8").split()) if listed.is_file() else set()
+    )
+    for gone in sorted(deleted):
+        if not kind_of(gone, files):
+            raise ValueError(
+                f"The screenshots of the run would delete {gone}, which is {others}."
+            )
+    try:
+        report = json.loads((folder / REPORT).read_text(encoding="utf-8"))
+        pictures = tuple(
+            Picture(
+                str(entry["path"]),
+                str(entry["status"]),
+                None if entry["share"] is None else float(entry["share"]),
+                reported_size(entry["before"]),
+                kind_of(str(entry["path"]), files),
+                # A report of a keep before the differences has none, and one
+                # before the comparisons none of those.
+                None if entry.get("diff") is None else str(entry["diff"]),
+                None if entry.get("comparison") is None else str(entry["comparison"]),
+                reported_number(entry.get("frame")),
+                reported_number(entry.get("frames")),
+                # A report of a keep before the threshold of sight names none of
+                # these, nor unseen.
+                reported_number(entry.get("pixels")),
+                reported_box(entry.get("box")),
+                reported_flag(entry.get("seen")),
+                bool(reported_flag(entry.get("all_over"))),
+            )
+            for entry in report["pictures"]
+        )
+        ignored = tuple(str(path) for path in report["ignored"])
+        unseen = tuple(
+            Picture(
+                str(entry["path"]),
+                "changed",
+                float(entry["share"]),
+                pixels=reported_number(entry["pixels"]),
+                box=reported_box(entry["box"]),
+                seen=False,
+            )
+            for entry in report.get("unseen", ())
+        )
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            f"The screenshots of the run have no readable {REPORT}: {error}"
+        ) from None
+    shown = {p.path for p in pictures if p.status != "deleted"}
+    removed = {p.path for p in pictures if p.status == "deleted"}
+    if shown != written or removed != deleted:
+        raise ValueError(
+            f"The {REPORT} of the screenshots names other pictures than the run holds."
+        )
+    if not pictures:
+        raise ValueError("The screenshots of the run hold nothing to commit.")
+    for below in unseen:
+        if kind_of(below.path) != "picture" or below.path in shown | removed:
+            raise ValueError(
+                f"The {REPORT} of the screenshots names {below.path} below the "
+                "threshold of sight, which is no picture that kept its file."
+            )
+    for picture in pictures:
+        for named, place, what in (
+            (picture.diff, diff_path, "difference"),
+            (picture.comparison, comparison_path, "comparison"),
+        ):
+            if not drawn_by_keep(folder, picture, named, place):
+                raise ValueError(
+                    f"The {REPORT} of the screenshots names {named} as the {what} of "
+                    f"{picture.path}, which is no PNG that keep drew for it."
+                )
+        if not frame_by_keep(picture):
+            raise ValueError(
+                f"The {REPORT} of the screenshots names frame {picture.frame} of "
+                f"{picture.frames} for the comparison {picture.comparison} of "
+                f"{picture.path}, which keep doesn't name so."
+            )
+    return Kept(pictures, ignored, unseen)
+
+
+def collect(folder: Path, shards: Sequence[Path], files: Sequence[str] = ()) -> Kept:
+    """Puts together what keep left in the folder of each shard, each checked as the
+    job that commits checks it, in folder, as one run of keep over every picture
+    would have left it. Each picture belongs to one shard: a path that two shards
+    changed raises ValueError rather than take either. The folder stays away when no
+    shard kept anything."""
+    sources: dict[str, Path] = {}
+    pictures: list[Picture] = []
+    unseen: list[Picture] = []
+    ignored: set[str] = set()
+    for shard in shards:
+        found = kept(shard, files)
+        for picture in found.pictures + found.unseen:
+            if picture.path in sources:
+                raise ValueError(
+                    f"The shards {sources[picture.path].name} and {shard.name} both "
+                    f"changed {picture.path}, which only one of them may render."
+                )
+            sources[picture.path] = shard
+        pictures += found.pictures
+        unseen += found.unseen
+        ignored.update(found.ignored)
+    pictures.sort(key=lambda picture: picture.path)
+    unseen.sort(key=lambda picture: picture.path)
+    merged = Kept(tuple(pictures), tuple(sorted(ignored)), tuple(unseen))
+    # The pictures of the differences and the comparisons, by their places in the
+    # folder, from the shard of their picture.
+    drawings = {
+        name: sources[picture.path]
+        for picture in pictures
+        for name in (picture.diff, picture.comparison)
+        if name
+    }
+    if pictures:
+        store(
+            folder,
+            merged,
+            lambda path: (sources[path] / "files" / path).read_bytes(),
+            lambda name: (drawings[name] / name).read_bytes(),
+        )
+    return merged
+
+
+def repository_of(root: Path) -> str:
+    """OWNER/NAME of the remote origin on GitHub, or nothing without one: then only an
+    address relative to its page shows a picture of this repository."""
+    remote = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+        text=True,
+        encoding="utf-8",
+    )
+    found = ORIGIN.search(remote.stdout.strip())
+    return found["repository"] if found else ""
+
+
+def from_main(address: SplitResult, repository: str) -> str:
+    """The path in the repository of what an address shows from main of repository
+    on GitHub, as .github/mkdocs_blueprint.py reads it; nothing for any other."""
+    segments = address.path.split("/")[1:]
+    if address.scheme != "https":
+        return ""
+    if address.hostname == "github.com" and segments[2:3] == ["raw"]:
+        rest = segments[3:]
+    elif address.hostname == "github.com" and segments[2:3] == ["blob"]:
+        rest = segments[3:] if "raw=true" in address.query.split("&") else []
+    elif address.hostname == "raw.githubusercontent.com":
+        rest = segments[2:]
+    else:
+        return ""
+    if "/".join(segments[:2]).lower() != repository.lower():
+        return ""
+    if rest[:2] == ["refs", "heads"]:
+        rest = rest[2:]
+    if len(rest) < 2 or rest[0] not in BRANCHES:
+        return ""
+    return posixpath.normpath(unquote("/".join(rest[1:])))
+
+
+def shown_picture(address: str, page: str, repository: str) -> str:
+    """The path in the repository of the file that a page shows at address: relative
+    to the page, or from main of repository; nothing for what is neither."""
+    try:
+        parsed = urlsplit(html.unescape(address))
+    except ValueError:
+        return ""
+    if parsed.scheme or parsed.netloc:
+        return from_main(parsed, repository)
+    return posixpath.normpath(posixpath.join(posixpath.dirname(page), parsed.path))
+
+
+def fitted_size(named: Size, before: Size, after: Size) -> Size | None:
+    """The size that a page should name for a picture that went from before to after,
+    or None when what it names still fits. A page that named the whole picture of
+    another shape names the whole new one. Any other keeps its width, as a smaller
+    picture in a gallery does, with the height of the new shape; a height may be one
+    pixel off, as rounding at a smaller size makes it, and a sharper picture of the
+    same shape changes nothing on the page."""
+    width, height = named
+    across, down = after
+    if named == before and width * down != height * across:
+        return after
+    if abs(height - width * down / across) <= 1:
+        return None
+    return width, max(1, round(width * down / across))
+
+
+def attributes_of(text: str) -> dict[str, re.Match[str]]:
+    return {match["name"].lower(): match for match in ATTRIBUTE.finditer(text)}
+
+
+def named_number(attribute: re.Match[str] | None) -> int:
+    """The whole number that an attribute names, 0 for anything else, such as 50%."""
+    value = attribute["value"].strip("\"'") if attribute else ""
+    return int(value) if value.isdecimal() else 0
+
+
+def fit_page(
+    text: str, page: str, sizes: dict[str, tuple[Size, Size]], repository: str
+) -> tuple[str, list[Correction]]:
+    """The text of a page with the width and the height corrected of each picture of
+    sizes that it names both of, in Markdown and in HTML, and what it corrected. The
+    numbers are all that changes: their quotes, every other attribute and the rest of
+    the page stay as they are."""
+    corrections: list[Correction] = []
+
+    def fit(attributes: str, address: str) -> str:
+        picture = shown_picture(address, page, repository)
+        found = attributes_of(attributes)
+        named = named_number(found.get("width")), named_number(found.get("height"))
+        if picture not in sizes or not all(named):
+            return attributes
+        fitted = fitted_size(named, *sizes[picture])
+        if fitted is None:
+            return attributes
+        corrections.append(Correction(picture, named, fitted))
+        new = dict(zip(("width", "height"), fitted, strict=True))
+
+        def number(match: re.Match[str]) -> str:
+            value = new.get(match["name"].lower())
+            if value is None:
+                return match[0]
+            digits = match["value"].strip("\"'")
+            return match["lead"] + match["value"].replace(digits, str(value))
+
+        return ATTRIBUTE.sub(number, attributes)
+
+    def in_markdown(match: re.Match[str]) -> str:
+        return match["shown"] + fit(match["attributes"], match["address"])
+
+    def in_html(match: re.Match[str]) -> str:
+        source = attributes_of(match[0]).get("src")
+        return fit(match[0], source["value"].strip("\"'")) if source else match[0]
+
+    return (
+        HTML_PICTURE.sub(in_html, MARKDOWN_PICTURE.sub(in_markdown, text)),
+        corrections,
+    )
+
+
+def resized(found: Kept, files: Path) -> dict[str, tuple[Size, Size]]:
+    """Each picture that came out at another size, with that of the committed file
+    and that of its file in the folder files; one whose file names none stays away,
+    so that its pages stay as they are."""
+    sizes = {}
+    for picture in found.pictures:
+        if picture.before is None:
+            continue
+        after = picture_size(picture.path, (files / picture.path).read_bytes())
+        if after is not None:
+            sizes[picture.path] = (picture.before, after)
+    return sizes
+
+
+def corrected_pages(
+    root: Path, sizes: dict[str, tuple[Size, Size]], repository: str
+) -> list[Page]:
+    """Each page that git tracks in the work tree at root whose named sizes no longer
+    fit a picture of sizes, corrected. Its text comes from the checkout and only the
+    numbers from the pictures, so that nothing of a script reaches a page. A page by
+    a path that isn't plain, a link and one that isn't UTF-8 stay as they are, and the
+    check that names the size explains them."""
+    pages: list[Page] = []
+    if not sizes:
+        return pages
+    for path in filter(None, git(root, "ls-files", "-z", "--", *PAGES).split("\0")):
+        file = root / path
+        if not is_plain(path) or file.is_symlink() or not file.is_file():
+            continue
+        try:
+            text = file.read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        corrected, corrections = fit_page(text, path, sizes, repository)
+        if corrections:
+            pages.append(Page(path, corrected.encode("utf-8"), tuple(corrections)))
+    return pages
+
+
+def pages_of_folder(
+    root: Path, folder: Path, repository: str, files: Sequence[str] = ()
+) -> list[Page]:
+    """The pages that the pictures of a folder of keep correct, for the job with the
+    release app, which reads these numbers from the files once kept checked them."""
+    found = kept(folder, files)
+    return corrected_pages(root, resized(found, folder / "files"), repository)
+
+
+def correct_work_tree(root: Path, found: Kept, repository: str) -> list[Page]:
+    """Writes the corrections of what keep found into the pages at root, for a person
+    who renders on their machine."""
+    pages = corrected_pages(root, resized(found, root), repository)
+    for page in pages:
+        (root / page.path).write_bytes(page.data)
+    return pages
+
+
+def contents(folder: Path, change: Picture | Page) -> bytes | None:
+    """What a commit writes for a picture of folder or for a corrected page, and None
+    for a picture that it deletes."""
+    if isinstance(change, Page):
+        return change.data
+    if change.status == "deleted":
+        return None
+    return (folder / "files" / change.path).read_bytes()
+
+
+def written(
+    folder: Path, pages: Sequence[Page] = (), files: Sequence[str] = ()
+) -> list[str]:
+    """The paths that the commits of the bot write: each picture and file of folder,
+    a deleted one too, and each corrected page."""
+    return [picture.path for picture in kept(folder, files).pictures] + [
+        page.path for page in pages
+    ]
+
+
+def overtaken(
+    paths: Sequence[str], compared: Mapping[str, Any], base: str = "main"
+) -> tuple[bool, str]:
+    """Whether base changed one of paths since the commit that was rendered, as
+    GitHub's comparison of the two lists the files, and why: a pull request from that
+    commit would conflict with base over each, so the bot renders base anew instead.
+    That happens when the pull request before merges while the next one renders. A
+    comparison in which base lacks the commit, as after a forced push, or that lists
+    as many files as GitHub lists at most, counts as such a change."""
+    files = compared.get("files") or []
+    if int(compared.get("behind_by") or 0):
+        return True, (
+            f"`{base}` no longer has the commit that was rendered, so the bot renders "
+            f"`{base}` anew."
+        )
+    if len(files) >= COMPARED_FILES:
+        return True, (
+            f"`{base}` changed {COMPARED_FILES} files or more since the commit that "
+            "was rendered, more than GitHub lists, so the bot renders it anew."
+        )
+    changed = {
+        str(name)
+        for file in files
+        for name in (file.get("filename"), file.get("previous_filename"))
+        if name
+    }
+    found = [path for path in paths if path in changed]
+    if not found:
+        return False, (
+            f"`{base}` changed none of the files of the pull request since the commit "
+            "that was rendered."
+        )
+    named = ", ".join(f"`{path}`" for path in found[:5])
+    more = f" and {len(found) - 5} more" if len(found) > 5 else ""
+    return True, (
+        f"`{base}` changed {named}{more} since the commit that was rendered, so a "
+        f"pull request from that commit would conflict: the bot renders `{base}` anew."
+    )
+
+
+def parts(
+    folder: Path,
+    largest: int = LARGEST,
+    pages: Sequence[Page] = (),
+    files: Sequence[str] = (),
+) -> list[list[Picture | Page]]:
+    """The pictures and files of folder, then the corrected pages, in the commits
+    that carry them, each request below largest once its files are in base64."""
+    found: list[list[Picture | Page]] = [[]]
+    size = 0
+    changes: list[Picture | Page] = [*kept(folder, files).pictures, *pages]
+    for change in changes:
+        data = contents(folder, change)
+        length = 0 if data is None else len(data) * 4 // 3
+        if found[-1] and length and size + length > largest:
+            found.append([])
+            size = 0
+        found[-1].append(change)
+        size += length
+    return found
+
+
+def commit_request(
+    folder: Path,
+    repository: str,
+    branch: str,
+    head: str,
+    headline: str,
+    body: str,
+    part: int = 1,
+    pages: Sequence[Page] = (),
+    files: Sequence[str] = (),
+) -> dict[str, Any]:
+    """The request to GitHub's GraphQL API that commits the part of what keep left in
+    folder, and of the corrected pages, onto a branch, as whoever sends it, and only
+    while the branch is still at head. The headline of one of several parts names it."""
+    every = parts(folder, LARGEST, pages, files)
+    if not 1 <= part <= len(every):
+        raise ValueError(
+            f"The screenshots of the run have no part {part}, of {len(every)}."
+        )
+    if len(every) > 1:
+        headline = f"{headline} ({part} of {len(every)})"
+    additions = []
+    deletions = []
+    for change in every[part - 1]:
+        data = contents(folder, change)
+        if data is None:
+            deletions.append({"path": change.path})
+        else:
+            additions.append(
+                {"path": change.path, "contents": base64.b64encode(data).decode()}
+            )
+    return {
+        "query": COMMIT,
+        "variables": {
+            "input": {
+                "branch": {"repositoryNameWithOwner": repository, "branchName": branch},
+                "expectedHeadOid": head,
+                "message": {"headline": headline, "body": body},
+                "fileChanges": {"additions": additions, "deletions": deletions},
+            }
+        },
+    }
+
+
+def shown_share(share: float | None) -> str:
+    """The share of the changed pixels, as the table of the pull request shows it."""
+    if share is None:
+        return "another size or frames"
+    if share >= 1:
+        return "100 %"
+    if share < 0.0001:
+        return "< 0.01 %"
+    return f"{share * 100:.2f} %"
+
+
+def listing(found: Kept) -> str:
+    """The pictures of a commit of the screenshot bot, as a table with what happened
+    to each, whether it changed all over, and for an animation which of its frames
+    the comparison shows."""
+    rows = ["| Picture | Change | Pixels changed |", "| --- | --- | ---: |"]
+    for picture in found.pictures:
+        if picture.kind != "picture":
+            continue
+        share = shown_share(picture.share) if picture.status == "changed" else ""
+        change = picture.status
+        if picture.all_over:
+            change += " all over"
+        if picture.frames is not None and picture.frames > 1:
+            change += f", most in frame {picture.frame} of {picture.frames}"
+        rows.append(f"| `{picture.path}` | {change} | {share} |")
+    return "".join(f"{row}\n" for row in rows)
+
+
+def file_listing(found: Kept) -> str:
+    """The files besides pictures of a commit of the screenshot bot, as a sentence
+    with a table of what happened to each; nothing when there are none."""
+    rows = [f"| `{p.path}` | {p.status} |" for p in found.pictures if p.kind == "file"]
+    if not rows:
+        return ""
+    return (
+        f"These files that `{SETTINGS.as_posix()}` names besides pictures changed:\n\n"
+        "| File | Change |\n| --- | --- |\n" + "".join(f"{row}\n" for row in rows)
+    )
+
+
+def below_sight(found: Kept) -> str:
+    """The pictures whose pixels differ only below the threshold of sight, which keep
+    their files, as a sentence; nothing when there are none."""
+    if not found.unseen:
+        return ""
+    named = ", ".join(
+        f"`{picture.path}` ({picture.pixels} pixels)" for picture in found.unseen[:10]
+    )
+    if len(found.unseen) > 10:
+        named += f" and {len(found.unseen) - 10} more"
+    return (
+        "These pictures differ only below the threshold of sight, such as in the "
+        "shades of a palette or at the edges of letters, so they keep their files: "
+        f"{named}.\n"
+    )
+
+
+def others(found: Kept) -> str:
+    """The files other than pictures that the script changed, which the bot leaves
+    out, as a sentence; nothing when there are none."""
+    if not found.ignored:
+        return ""
+    named = ", ".join(f"`{path}`" for path in found.ignored[:10])
+    if len(found.ignored) > 10:
+        named += f" and {len(found.ignored) - 10} more"
+    return (
+        "The script changed other files too, which the bot leaves out, because it "
+        "takes only pictures from the script, and the files that "
+        f"`{SETTINGS.as_posix()}` names: {named}.\n"
+    )
+
+
+def corrections(pages: Sequence[Page]) -> str:
+    """The sizes that the bot corrected on the pages, as a table with a sentence;
+    nothing when it corrected none."""
+    if not pages:
+        return ""
+    rows = ["| Page | Picture | Named | Now |", "| --- | --- | ---: | ---: |"]
+    for page in pages:
+        for change in page.corrections:
+            named = " x ".join(map(str, change.named))
+            fitted = " x ".join(map(str, change.fitted))
+            rows.append(f"| `{page.path}` | `{change.picture}` | {named} | {fitted} |")
+    return (
+        "These pictures came out at another size, so the width and the height that "
+        "these pages name for them changed, and nothing else on those pages:\n\n"
+        + "".join(f"{row}\n" for row in rows)
+    )
+
+
+def drawn_differences(found: Kept) -> str:
+    """Where the comparisons and the pictures of the differences are, as a sentence;
+    nothing when keep drew none."""
+    if not any(picture.diff for picture in found.pictures):
+        return ""
+    return (
+        "The artifact of the run also holds, for each of them that kept its size and "
+        "frames, in `comparison/` the place of the change before and after in one "
+        "picture, in its own colors and cut to the changes, with a red frame around "
+        "each change on both sides, and in `diff/` the whole picture with every "
+        "changed pixel in red, behind a thin veil. Both show the same frame: for an "
+        "animation the one with the most changes, which the table names. A picture "
+        "that changed all over, as the table says, gets no frames.\n"
+    )
+
+
+def summary(found: Kept) -> str:
+    """What keep or collect found, for the summary of the run or the terminal."""
+    if any(picture.kind == "picture" for picture in found.pictures):
+        text = "These pictures look different:\n\n" + listing(found)
+    elif found.pictures:
+        text = "Every picture looks as committed.\n"
+    else:
+        text = "Every picture looks as committed, so no file changes.\n"
+    for extra in (
+        drawn_differences(found),
+        below_sight(found),
+        file_listing(found),
+        others(found),
+    ):
+        if extra:
+            text += f"\n{extra}"
+    return text
+
+
+def report(
+    folder: Path,
+    sha: str,
+    run: str,
+    script: Path = SCRIPT,
+    pages: Sequence[Page] = (),
+    files: Sequence[str] = (),
+) -> str:
+    """The description of the bot's pull request, for the pictures and files of
+    script and the pages that they correct."""
+    found = kept(folder, files)
+    text = f"`bash {script.as_posix()}` rendered the pictures of `main` anew, on {sha}"
+    if any(picture.kind == "picture" for picture in found.pictures):
+        text += ", and these look different:\n\n" + listing(found)
+    else:
+        text += ", and every picture looks as committed.\n"
+    for extra in (
+        drawn_differences(found),
+        below_sight(found),
+        file_listing(found),
+        corrections(pages),
+    ):
+        if extra:
+            text += f"\n{extra}"
+    if any(picture.path == SOCIAL_PREVIEW for picture in found.pictures):
+        text += (
+            f"\n`{SOCIAL_PREVIEW}` changed: once this pull request is merged, upload "
+            "it under **Settings → General → Social preview**, where GitHub takes it "
+            "from. Until GitHub shows it, the nightly look of the bot-health bot of a "
+            "public repository keeps the issue *Upload the new social preview* open; "
+            "GitHub shows the social preview of no private one.\n"
+        )
+    extra = others(found)
+    if extra:
+        text += f"\n{extra}"
+    return text + (
+        "\nA picture whose pixels stayed the same keeps its file, so only these "
+        "change. This pull request merges itself once every required check passes; "
+        "the bot keeps it current with `main`, and closes it when `main` looks as "
+        "rendered without it. The workflow run keeps the pictures for three days: "
+        f"{run}\n"
+    )
