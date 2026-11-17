@@ -33,3 +33,5 @@ Questions and problems: see [SUPPORT.md](SUPPORT.md). Report vulnerabilities pri
 ## License
 
 MIT; see [LICENSE](LICENSE). Every file names its license in the machine-readable form of [REUSE](https://reuse.software).
+
+This line tests the review rule of main.
